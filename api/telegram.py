@@ -449,9 +449,24 @@ def _edit(tg, chat_id, message_id, text, markup=None):
     )
 
 
-def advance(tg, chat_id: int, menu_id: int, source_id: int, state: dict, text: str) -> None:
-    """Show the next question in the menu, or draw and send the QR code if everything is chosen."""
+def advance(tg, chat_id: int, menu_id: int, source_id: int, state: dict, text: str, below: bool = False) -> None:
+    """Show the next question, or draw and send the QR code if everything is chosen.
+
+    below=True: the user has just typed something under the menu, so the next question comes
+    as a new message (under their reply) and the old menu keeps only what was chosen.
+    """
     step = next_step(state, text)
+    if step and below:
+        _edit(tg, chat_id, menu_id, f"Цвет кода: {color_name(state['fg'])}")
+        question, markup = step
+        tg.call(
+            "sendMessage",
+            chat_id=chat_id,
+            text=question,
+            reply_markup=markup,
+            reply_parameters={"message_id": source_id},  # the buttons read the text from this reply
+        )
+        return
     if step:
         _edit(tg, chat_id, menu_id, *step)
         return
@@ -511,7 +526,7 @@ def handle_hex(tg, chat_id: int, msg: dict, prompt: tuple) -> None:
         tg.call("deleteMessage", chat_id=chat_id, message_id=msg["reply_to_message"]["message_id"])
     except RuntimeError:
         pass
-    advance(tg, chat_id, menu_id, source_id, new, text)
+    advance(tg, chat_id, menu_id, source_id, new, text, below=True)
 
 
 # --- Vercel entry --------------------------------------------------------------------------

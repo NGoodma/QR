@@ -238,11 +238,17 @@ def test_hex_reply_for_png_sends_the_code_right_away():
 def test_hex_for_jpg_code_then_background():
     s = {"kind": "t", "fmt": "jpg", "dots": "rd"}
     tg = run(reply_to(ask_hex(s), "#123456"))
-    edit = tg.calls[-1]
-    assert edit["method"] == "editMessageText" and edit["message_id"] == 11 and edit["text"] == "Выберите цвет фона"
-    rows = buttons(edit["reply_markup"])
+    assert tg.methods() == ["deleteMessage", "editMessageText", "sendMessage"]
+    # the old menu (above the user's reply) keeps only the choice, without buttons
+    assert tg.calls[1] == {"method": "editMessageText", "files": None, "chat_id": 5, "message_id": 11,
+                           "text": "Цвет кода: #123456"}
+    # the background question comes as a new message, under the user's reply, still tied to the text
+    ask = tg.calls[-1]
+    assert ask["text"] == "Выберите цвет фона" and ask["reply_parameters"] == {"message_id": 10}
+    rows = buttons(ask["reply_markup"])
     assert rows[0] == ["⚫ Чёрный", "⚪ Белый"]  # a custom code color hides no palette color
-    assert edit["reply_markup"]["inline_keyboard"][0][1]["callback_data"] == "q:t:jpg:rd:123456:white"
+    assert rows[-2:] == [["🎨 Свой цвет (HEX)"], ["← Назад"]]
+    assert ask["reply_markup"]["inline_keyboard"][0][1]["callback_data"] == "q:t:jpg:rd:123456:white"
     # and a custom background too
     p = ask_hex({**s, "fg": "123456"})
     assert "цвета фона" in p["text"]
