@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt pytest opencv-python-headless zxing-cpp
+      - run: pip install -r requirements.txt pytest opencv-python-headless zxing-cpp resvg-py
       - run: pytest -q
 
   deploy:

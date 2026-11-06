@@ -66,26 +66,30 @@ def test_link_asks_for_format_as_a_reply():
     tg = run(link_message())
     [c] = tg.calls
     assert c["text"] == "Выберите формат"
-    assert buttons(c["reply_markup"]) == [["JPG", "PNG"]]
+    assert buttons(c["reply_markup"]) == [["JPG", "PNG", "SVG"]]  # first step: no "Back"
     assert c["reply_parameters"] == {"message_id": 10}
-    assert c["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "q:t:jpg::::"
+    assert c["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "q:t:jpg:::"
 
 
-def test_any_text_is_accepted():
-    assert run(link_message("ты пидр")).calls[0]["text"] == "Выберите формат"
+def test_any_text_is_accepted_with_a_wifi_hint():
+    assert run(link_message("ты пидр")).calls[0]["text"] == "Выберите формат\n\n" + bot.WIFI_HINT
+    assert bot.WIFI_HINT in run(tap({"kind": "t"}, "ты пидр")).calls[-1]["text"]  # also after "Back"
     assert run(link_message("/start")).calls[0]["text"] == bot.START_TEXT
 
 
 def test_too_long_text_is_refused():
     assert run(link_message("я" * 1300)).calls[0]["text"] == bot.TOO_LONG
-    assert run(link_message("я" * 1000)).calls[0]["text"] == "Выберите формат"
+    assert run(link_message("я" * 1000)).calls[0]["text"].startswith("Выберите формат")
 
 
 def test_wifi_looking_text_asks_what_to_do():
     [c] = run(link_message(WIFI)).calls
     assert buttons(c["reply_markup"]) == [["📶 Код для подключения к Wi-Fi"], ["📝 Просто текст"]]
-    assert [r[0]["callback_data"] for r in c["reply_markup"]["inline_keyboard"]] == ["q:w:::::", "q:t:::::"]
-    assert run(tap("q:w:::::", WIFI)).calls[-1]["text"] == "Выберите формат"
+    assert [r[0]["callback_data"] for r in c["reply_markup"]["inline_keyboard"]] == ["q:w::::", "q:t::::"]
+    edit = run(tap("q:w::::", WIFI)).calls[-1]
+    assert edit["text"] == "Выберите формат"  # no hint: the user already chose
+    assert edit["reply_markup"]["inline_keyboard"][-1] == [{"text": "← Назад", "callback_data": "q:::::"}]
+    assert run(tap("q:t::::", WIFI)).calls[-1]["text"] == "Выберите формат"
 
 
 @pytest.mark.parametrize("text, wifi", [
@@ -105,30 +109,42 @@ def test_wifi_payload_escapes_special_characters():
     assert bot.payload(WIFI, "t") == WIFI
 
 
-def test_steps_in_order():
+def test_steps_in_order_with_back_buttons():
     s = {"kind": "t"}
-    assert run(tap(q(s))).calls[-1]["text"] == "Выберите формат"
     edit = run(tap(q({**s, "fmt": "png"}))).calls[-1]
     assert edit["text"] == "Выберите стиль точек"
-    assert buttons(edit["reply_markup"]) == [["⬛ Квадратные", "🔲 Скруглённые", "⚫ Круглые"]]
+    assert buttons(edit["reply_markup"]) == [["⬛ Квадратные", "🔲 Скруглённые", "⚫ Круглые"], ["← Назад"]]
+    assert edit["reply_markup"]["inline_keyboard"][-1][0]["callback_data"] == q(s)
     edit = run(tap(q({**s, "fmt": "png", "dots": "ci"}))).calls[-1]
     assert edit["text"] == "Выберите цвет"
     rows = buttons(edit["reply_markup"])
-    assert rows[0] == ["⚫ Чёрный", "⚪ Белый"]
-    assert sum(len(r) for r in rows) == len(bot.COLORS)
+    assert rows[0] == ["⚫ Чёрный", "⚪ Белый"] and rows[-1] == ["← Назад"]
+    assert sum(len(r) for r in rows[:-1]) == len(bot.COLORS)
+    assert edit["reply_markup"]["inline_keyboard"][-1][0]["callback_data"] == q({**s, "fmt": "png"})
 
 
-def test_png_is_sent_right_after_color_with_transparent_background():
-    tg = run(tap({"kind": "t", "fmt": "png", "dots": "rd", "fg": "red"}))
+def test_back_from_background_goes_to_color():
+    s = {"kind": "t", "fmt": "jpg", "dots": "sq", "fg": "black"}
+    back = run(tap(s)).calls[-1]["reply_markup"]["inline_keyboard"][-1][0]
+    assert back == {"text": "← Назад", "callback_data": q({**s, "fg": None})}
+
+
+@pytest.mark.parametrize("fmt, mime, dots", [("png", "image/png", "rd"), ("svg", "image/svg+xml", "ci")])
+def test_png_and_svg_are_sent_right_after_color(fmt, mime, dots):
+    tg = run(tap({"kind": "t", "fmt": fmt, "dots": dots, "fg": "red"}))
     assert tg.methods() == ["answerCallbackQuery", "editMessageText", "sendDocument"]
     doc = tg.calls[-1]
-    name, data, mime = doc["files"]["document"]
-    assert (name, mime) == ("qr.png", "image/png")
+    name, data, sent_mime = doc["files"]["document"]
+    assert (name, sent_mime) == (f"qr.{fmt}", mime)
     assert doc["reply_parameters"] == {"message_id": 10}
-    img = Image.open(io.BytesIO(data))
-    assert img.format == "PNG" and img.mode == "RGBA"
-    assert img.getpixel((0, 0))[3] == 0  # corner is background: transparent
-    assert tg.calls[1]["text"] == "Готово: PNG, скруглённые точки, красный"
+    style = bot.DOTS[dots][1]
+    assert tg.calls[1]["text"] == f"Готово: {fmt.upper()}, {style}, красный"
+    if fmt == "png":
+        img = Image.open(io.BytesIO(data))
+        assert img.format == "PNG" and img.mode == "RGBA"
+        assert img.getpixel((0, 0))[3] == 0  # corner is background: transparent
+    else:
+        assert data.startswith(b"<svg") and b'fill="#e53935"' in data and b"<rect" not in data  # no background
 
 
 def test_jpg_asks_for_background_without_the_same_color():
@@ -137,34 +153,18 @@ def test_jpg_asks_for_background_without_the_same_color():
     rows = buttons(edit["reply_markup"])
     assert rows[0] == ["⚪ Белый"]
     assert "⚫ Чёрный" not in sum(rows, [])
-    data = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row]
+    data = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"][:-1] for b in row]
     assert all(d.startswith("q:t:jpg:sq:black:") for d in data)
 
 
-def test_jpg_asks_about_corners_then_sends():
-    s = {"kind": "t", "fmt": "jpg", "dots": "sq", "fg": "blue", "bg": "yellow"}
-    edit = run(tap(s)).calls[-1]
-    assert edit["text"] == "Углы фона" and buttons(edit["reply_markup"]) == [["⬜ Прямые", "▢ Скруглённые"]]
-
-    tg = run(tap({**s, "corners": "sq"}))
+def test_jpg_is_sent_after_background():
+    tg = run(tap({"kind": "t", "fmt": "jpg", "dots": "sq", "fg": "blue", "bg": "yellow"}))
     name, data, mime = tg.calls[-1]["files"]["document"]
     assert (name, mime) == ("qr.jpg", "image/jpeg")
     img = Image.open(io.BytesIO(data))
     r, g, b = img.getpixel((2, 2))
     assert r > 230 and g > 200 and b < 90  # yellow up to the very corner
     assert tg.calls[1]["text"] == "Готово: JPG, квадратные точки, синий на жёлтом фоне"
-
-    tg = run(tap({**s, "corners": "rd"}))
-    img = Image.open(io.BytesIO(tg.calls[-1]["files"]["document"][1]))
-    assert min(img.getpixel((2, 2))) > 240  # cut-off corner is white
-    r, g, b = img.getpixel((img.width // 2, 5))
-    assert r > 230 and g > 200 and b < 90  # the edge between corners is still yellow
-    assert tg.calls[1]["text"] == "Готово: JPG, квадратные точки, синий на жёлтом фоне, скруглённые углы"
-
-
-def test_white_background_skips_the_corner_question():
-    tg = run(tap({"kind": "t", "fmt": "jpg", "dots": "ci", "fg": "black", "bg": "white"}))
-    assert tg.methods()[-1] == "sendDocument"
 
 
 def test_wifi_code_and_caption():
@@ -173,9 +173,11 @@ def test_wifi_code_and_caption():
 
 
 @pytest.mark.parametrize("data", [
-    "q:t:jpg:sq:red:red:",    # same color twice
-    "q:t:gif::::", "q:t:jpg:star:::", "q:x:::::", "q:t:jpg:sq:pink::",
-    "q:t:jpg", "zzz", "f:jpg", "c:png:red", "b:black:white",  # old buttons from the previous version
+    "q:t:jpg:sq:red:red",     # same color twice
+    "q:t:png:sq:red:white",   # PNG has no background
+    "q:t:gif:::", "q:t:jpg:star::", "q:x::::", "q:t:jpg:sq:pink:",
+    "q:t:jpg", "zzz", "q:t:jpg:sq:black:white:rd",  # the version with corners
+    "f:jpg", "c:png:red", "b:black:white",           # the first version
 ])
 def test_bad_callbacks_send_nothing(data):
     tg = run(tap(data))
@@ -191,7 +193,7 @@ def test_lost_text_shows_alert():
 
 
 def test_callback_data_fits_telegram_limit():
-    longest = {"kind": "w", "fmt": "jpg", "dots": "ci", "fg": "purple", "bg": "orange", "corners": "rd"}
+    longest = {"kind": "w", "fmt": "jpg", "dots": "ci", "fg": "purple", "bg": "orange"}
     assert len(bot.encode(longest).encode()) <= 64
 
 
@@ -201,12 +203,16 @@ def test_dense_code_gets_a_warning():
     assert "⚠️" not in run(tap(s, URL)).calls[-1]["caption"]
 
 
-def _scan(png_or_jpg: bytes):
+def _scan(image: bytes):
+    """Decode with OpenCV and ZXing (used in many phone apps). SVG is rasterized with resvg first."""
     cv2 = pytest.importorskip("cv2")
     zxingcpp = pytest.importorskip("zxingcpp")
     np = pytest.importorskip("numpy")
-    img = Image.open(io.BytesIO(png_or_jpg))
-    if img.mode == "RGBA":  # what the transparent PNG looks like on a white page
+    if image.startswith(b"<svg"):
+        image = bytes(pytest.importorskip("resvg_py").svg_to_bytes(svg_string=image.decode()))
+    img = Image.open(io.BytesIO(image))
+    if img.mode in ("RGBA", "LA", "P"):  # what a transparent image looks like on a white page
+        img = img.convert("RGBA")
         page = Image.new("RGB", img.size, "white")
         page.paste(img, mask=img)
         img = page
@@ -218,12 +224,22 @@ TEXTS = [URL, "ты пидр", "WIFI:T:WPA;S:MyHome;P:secret123;;", "Длинн�
 
 
 @pytest.mark.parametrize("dots", list(bot.DOTS))
-@pytest.mark.parametrize("fmt, corners", [("png", "sq"), ("jpg", "sq"), ("jpg", "rd")])
+@pytest.mark.parametrize("fmt", list(bot.FORMATS))
 @pytest.mark.parametrize("text", TEXTS)
-def test_every_style_scans(dots, fmt, corners, text):
-    """Decode the real image with two different scanners: OpenCV and ZXing (used in many phone apps)."""
-    image = bot.make_qr(text, fmt, "blue", "white" if fmt == "jpg" else None, dots, corners)
+def test_every_style_and_format_scans(dots, fmt, text):
+    image = bot.make_qr(text, fmt, "blue", "white" if fmt == "jpg" else None, dots)
     assert _scan(image) == (text, [text])
+
+
+def test_svg_has_the_same_modules_as_the_raster():
+    """Square SVG and square PNG, both rasterized, match pixel for pixel (up to anti-aliasing)."""
+    resvg = pytest.importorskip("resvg_py")
+    svg = Image.open(io.BytesIO(bytes(resvg.svg_to_bytes(svg_string=bot.make_qr(URL, "svg", "black").decode()))))
+    png = Image.open(io.BytesIO(bot.make_qr(URL, "png", "black")))
+    assert svg.size == png.size
+    a, b = svg.convert("RGBA").getchannel("A"), png.getchannel("A")
+    differ = sum(1 for x, y in zip(a.tobytes(), b.tobytes()) if abs(x - y) > 128)
+    assert differ < svg.width * svg.height * 0.001
 
 
 def test_every_unwarned_color_pair_scans():
@@ -235,9 +251,7 @@ def test_every_unwarned_color_pair_scans():
                 continue
             for text in TEXTS:
                 for dots in bot.DOTS:
-                    for corners in bot.CORNERS:
-                        image = bot.make_qr(text, "jpg", fg, bg, dots, corners)
-                        assert _scan(image)[1] == [text], (fg, bg, text, dots, corners)
+                    assert _scan(bot.make_qr(text, "jpg", fg, bg, dots))[1] == [text], (fg, bg, text, dots)
 
 
 def test_multipart_encodes_nested_params(monkeypatch):
@@ -268,12 +282,13 @@ def test_multipart_encodes_nested_params(monkeypatch):
     ("blue", "orange", True),
 ])
 def test_readability_warning_for_jpg(fg, bg, warned):
-    caption = run(tap({"kind": "t", "fmt": "jpg", "dots": "sq", "fg": fg, "bg": bg, "corners": "sq"})).calls[-1]["caption"]
+    caption = run(tap({"kind": "t", "fmt": "jpg", "dots": "sq", "fg": fg, "bg": bg})).calls[-1]["caption"]
     assert ("⚠️" in caption) is warned
 
 
-def test_readability_warning_for_light_png():
-    s = {"kind": "t", "fmt": "png", "dots": "sq"}
+@pytest.mark.parametrize("fmt", ["png", "svg"])
+def test_readability_warning_for_light_transparent(fmt):
+    s = {"kind": "t", "fmt": fmt, "dots": "sq"}
     assert "⚠️" in run(tap({**s, "fg": "white"})).calls[-1]["caption"]
     assert "⚠️" not in run(tap({**s, "fg": "black"})).calls[-1]["caption"]
 

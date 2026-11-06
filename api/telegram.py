@@ -1,13 +1,13 @@
 """Telegram QR bot as a Vercel serverless function (webhook at /api/telegram).
 
 Flow: send a link or any text -> (two lines that look like a Wi-Fi name and password:
-"Wi-Fi or plain text?") -> format [JPG] [PNG] -> dot style -> color -> for JPG also
-background color and background corners -> the QR code arrives as a file.
-PNG has a transparent background.
+"Wi-Fi or plain text?") -> format [JPG] [PNG] [SVG] -> dot style -> color -> for JPG also
+background color -> the QR code arrives as a file. PNG and SVG have a transparent background.
+Every step after the first has a "Back" button.
 
 No storage: the bot's menu message is a reply to the user's text, so every button press
 finds the text in callback_query.message.reply_to_message. The choices so far travel in
-callback_data as "q:<kind>:<fmt>:<dots>:<fg>:<bg>:<corners>", empty fields not chosen yet.
+callback_data as "q:<kind>:<fmt>:<dots>:<fg>:<bg>", empty fields not chosen yet.
 """
 from __future__ import annotations
 
@@ -17,10 +17,11 @@ import json
 import logging
 import os
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 import qrcode
 import requests
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 from qrcode.exceptions import DataOverflowError
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import CircleModuleDrawer, RoundedModuleDrawer, SquareModuleDrawer
@@ -49,20 +50,29 @@ DOTS = {
     "rd": ("🔲 Скруглённые", "скруглённые точки", RoundedModuleDrawer, RoundedModuleDrawer),
     "ci": ("⚫ Круглые", "круглые точки", CircleModuleDrawer, RoundedModuleDrawer),
 }
-CORNERS = {"sq": ("⬜ Прямые", "прямые углы"), "rd": ("▢ Скруглённые", "скруглённые углы")}
-CORNER_FILL = "#ffffff"  # JPG has no transparency: the cut-off corners are white
+FORMATS = {"jpg": "image/jpeg", "png": "image/png", "svg": "image/svg+xml"}
 BOX, BORDER = 12, 4  # pixels per module, quiet zone in modules
 DENSE_VERSION = 25  # from here on some scanners (OpenCV) stop reading the code
 
 START_TEXT = (
-    "Привет! Пришли ссылку или любой текст, и я сделаю из него QR-код: JPG или PNG, "
-    "нужного цвета, с квадратными, скруглёнными или круглыми точками.\n\n"
+    "Привет! Пришли ссылку или любой текст, и я сделаю из него QR-код: JPG, PNG или "
+    "SVG, нужного цвета, с квадратными, скруглёнными или круглыми точками.\n\n"
     "Для Wi-Fi пришли двумя строками название сети и пароль, например:\n"
     "MyHome\nsecret123\n"
     "По такому коду телефон сам предложит подключиться к сети."
 )
 NO_TEXT = "Не вижу текст: пришли его ещё раз"
+WIFI_HINT = (
+    "Если это Wi-Fi, пришли название сети и пароль двумя строками, например:\n"
+    "MyHome\nsecret123\n"
+    "Тогда телефон по коду сам подключится к сети."
+)
 TOO_LONG = "Слишком длинный текст для QR-кода: влезает около 2300 латинских букв или 1100 русских"
+
+
+def is_valid_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def webhook_secret(token: str) -> str:
@@ -116,9 +126,11 @@ def fits(data: str) -> bool:
 # --- images ------------------------------------------------------------------------------
 
 
-def make_qr(data: str, fmt: str, fg: str, bg: str | None = None, dots: str = "sq", corners: str = "sq") -> bytes:
-    """PNG: transparent background. JPG: background `bg`, optionally with rounded corners."""
+def make_qr(data: str, fmt: str, fg: str, bg: str | None = None, dots: str = "sq") -> bytes:
+    """PNG and SVG: transparent background. JPG: background `bg`."""
     qr = build_qr(data)
+    if fmt == "svg":
+        return make_svg(qr, COLOR[fg][2], dots)
     _, _, drawer, eye = DOTS[dots]
     # Draw black on white, then use it as a mask to paint the colors (also gives a clean transparent PNG).
     mask = ImageOps.invert(
@@ -130,14 +142,52 @@ def make_qr(data: str, fmt: str, fg: str, bg: str | None = None, dots: str = "sq
         img = Image.composite(Image.new("RGBA", size, COLOR[fg][2]), Image.new("RGBA", size, (0, 0, 0, 0)), mask)
         img.save(buf, format="PNG")
     else:
-        back = Image.new("RGB", size, COLOR[bg][2])
-        if corners == "rd":  # radius = the quiet zone, so the code itself is never cut
-            shape = Image.new("L", size, 0)
-            ImageDraw.Draw(shape).rounded_rectangle((0, 0, size[0] - 1, size[1] - 1), radius=BORDER * BOX, fill=255)
-            back = Image.composite(back, Image.new("RGB", size, CORNER_FILL), shape)
-        img = Image.composite(Image.new("RGB", size, COLOR[fg][2]), back, mask)
+        img = Image.composite(Image.new("RGB", size, COLOR[fg][2]), Image.new("RGB", size, COLOR[bg][2]), mask)
         img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
+
+
+def _is_eye(r: int, c: int, n: int) -> bool:
+    """One of the three big corner squares (7x7 modules)."""
+    return (r < 7 and c < 7) or (r < 7 and c >= n - 7) or (r >= n - 7 and c < 7)
+
+
+def make_svg(qr: qrcode.QRCode, color: str, dots: str) -> bytes:
+    """Vector QR with the same shapes as the raster one: one path, 1 unit = 1 module.
+    Square: plain squares. Rounded: a corner is rounded when both neighbours at that corner are empty
+    (same rule as qrcode's RoundedModuleDrawer). Round: circles, corner squares stay rounded."""
+    m = qr.modules
+    n = len(m)
+    on = lambda r, c: 0 <= r < n and 0 <= c < n and bool(m[r][c])  # noqa: E731
+    parts = []
+    for r in range(n):
+        for c in range(n):
+            if not m[r][c]:
+                continue
+            x, y = c + BORDER, r + BORDER
+            style = dots if dots != "ci" or not _is_eye(r, c, n) else "rd"
+            if style == "ci":
+                parts.append(f"M{x},{y + 0.5}a.5,.5 0 1,0 1,0a.5,.5 0 1,0 -1,0z")
+            elif style == "sq":
+                parts.append(f"M{x},{y}h1v1h-1z")
+            else:
+                up, down, left, right = on(r - 1, c), on(r + 1, c), on(r, c - 1), on(r, c + 1)
+                tl, tr = not (up or left), not (up or right)
+                br, bl = not (down or right), not (down or left)
+                q = 0.5
+                d = f"M{x + (q if tl else 0)},{y}"
+                d += f"H{x + 1 - (q if tr else 0)}" + (f"a{q},{q} 0 0,1 {q},{q}" if tr else "")
+                d += f"V{y + 1 - (q if br else 0)}" + (f"a{q},{q} 0 0,1 -{q},{q}" if br else "")
+                d += f"H{x + (q if bl else 0)}" + (f"a{q},{q} 0 0,1 -{q},-{q}" if bl else "")
+                d += f"V{y + (q if tl else 0)}" + (f"a{q},{q} 0 0,1 {q},-{q}" if tl else "")
+                parts.append(d + "z")
+    side = n + 2 * BORDER
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {side} {side}" '
+        f'width="{side * BOX}" height="{side * BOX}">'
+        f'<path fill="{color}" d="{"".join(parts)}"/></svg>'
+    )
+    return svg.encode()
 
 
 def _luminance(hex_color: str) -> float:
@@ -158,7 +208,7 @@ MIN_GRAY_DIFF = 80  # below this some pairs fail to scan (measured on every pair
 def readability_note(fg: str, bg: str | None) -> str | None:
     """Warn about combinations scanners struggle with."""
     lf = _luminance(COLOR[fg][2])
-    if bg is None:  # PNG, transparent background
+    if bg is None:  # PNG or SVG, transparent background
         return "Светлый код на прозрачном фоне виден только на тёмном фоне" if lf > 0.5 else None
     if lf > _luminance(COLOR[bg][2]):
         return "Светлый код на тёмном фоне читают не все сканеры. Надёжнее тёмный код на светлом фоне"
@@ -169,7 +219,7 @@ def readability_note(fg: str, bg: str | None) -> str | None:
 
 # --- the choice, step by step --------------------------------------------------------------
 
-FIELDS = ("kind", "fmt", "dots", "fg", "bg", "corners")
+FIELDS = ("kind", "fmt", "dots", "fg", "bg")
 
 
 def encode(state: dict) -> str:
@@ -183,8 +233,7 @@ def decode(data: str) -> dict | None:
         return None
     s = {f: v or None for f, v in zip(FIELDS, parts[1:])}
     allowed = {
-        "kind": {"t", "w"}, "fmt": {"jpg", "png"}, "dots": set(DOTS),
-        "fg": set(COLOR), "bg": set(COLOR), "corners": set(CORNERS),
+        "kind": {"t", "w"}, "fmt": set(FORMATS), "dots": set(DOTS), "fg": set(COLOR), "bg": set(COLOR),
     }
     if any(v is not None and v not in allowed[f] for f, v in s.items()):
         return None
@@ -201,41 +250,45 @@ def _rows(buttons: list, first: int, per_row: int = 3) -> list[list]:
     return [buttons[:first]] + [buttons[i : i + per_row] for i in range(first, len(buttons), per_row)]
 
 
-def next_step(state: dict) -> tuple[str, dict] | None:
-    """The next question and its keyboard, or None when everything is chosen.
-    Fills in choices that need no question (e.g. corners on a white background)."""
+def _back(state: dict, text: str) -> list[list]:
+    """A row with "Back": undo the last choice. None on the first step (nothing to go back to)."""
+    chosen = [f for f in FIELDS if state[f]]
+    if chosen == ["kind"] and not parse_wifi(text):  # kind was set by the bot, not asked
+        chosen = []
+    if not chosen:
+        return []
+    return [[{"text": "← Назад", "callback_data": encode({**state, chosen[-1]: None})}]]
+
+
+def next_step(state: dict, text: str) -> tuple[str, dict] | None:
+    """The next question and its keyboard, or None when everything is chosen."""
     if not state["kind"]:
-        return "Похоже на сеть Wi-Fi и пароль. Что сделать?", {"inline_keyboard": [
+        question, rows = "Похоже на сеть Wi-Fi и пароль. Что сделать?", [
             _buttons(state, "kind", [("w", "📶 Код для подключения к Wi-Fi")]),
             _buttons(state, "kind", [("t", "📝 Просто текст")]),
-        ]}
-    if not state["fmt"]:
-        return "Выберите формат", {"inline_keyboard": [_buttons(state, "fmt", [("jpg", "JPG"), ("png", "PNG")])]}
-    if not state["dots"]:
-        return "Выберите стиль точек", {"inline_keyboard": [_buttons(state, "dots", [(k, v[0]) for k, v in DOTS.items()])]}
-    if not state["fg"]:
+        ]
+    elif not state["fmt"]:
+        question = "Выберите формат"
+        if state["kind"] == "t" and not is_valid_url(text) and not parse_wifi(text):
+            question += "\n\n" + WIFI_HINT
+        rows = [_buttons(state, "fmt", [(k, k.upper()) for k in FORMATS])]
+    elif not state["dots"]:
+        question, rows = "Выберите стиль точек", [_buttons(state, "dots", [(k, v[0]) for k, v in DOTS.items()])]
+    elif not state["fg"]:
         b = _buttons(state, "fg", [(cid, f"{e} {name}") for cid, name, _, e, _ in COLORS])
-        return "Выберите цвет", {"inline_keyboard": _rows(b, 2)}
-    if state["fmt"] == "png":
-        return None
-    if not state["bg"]:
+        question, rows = "Выберите цвет", _rows(b, 2)
+    elif state["fmt"] == "jpg" and not state["bg"]:
         colors = [(cid, f"{e} {name}") for cid, name, _, e, _ in COLORS if cid != state["fg"]]
         first = 2 if state["fg"] not in ("black", "white") else 1  # black and white on the first row
-        return "Выберите цвет фона", {"inline_keyboard": _rows(_buttons(state, "bg", colors), first)}
-    if not state["corners"]:
-        if COLOR[state["bg"]][2] == CORNER_FILL:  # white corners on a white background: nothing to round
-            state["corners"] = "sq"
-            return None
-        return "Углы фона", {"inline_keyboard": [_buttons(state, "corners", [(k, v[0]) for k, v in CORNERS.items()])]}
-    return None
+        question, rows = "Выберите цвет фона", _rows(_buttons(state, "bg", colors), first)
+    else:
+        return None
+    return question, {"inline_keyboard": rows + _back(state, text)}
 
 
 def summary(state: dict) -> str:
     fmt, fg, bg = state["fmt"], state["fg"], state["bg"]
-    parts = [fmt.upper(), DOTS[state["dots"]][1], COLOR[fg][1].lower() + (f" на {COLOR[bg][4]} фоне" if bg else "")]
-    if state.get("corners") == "rd":
-        parts.append(CORNERS["rd"][1])
-    return ", ".join(parts)
+    return ", ".join([fmt.upper(), DOTS[state["dots"]][1], COLOR[fg][1].lower() + (f" на {COLOR[bg][4]} фоне" if bg else "")])
 
 
 # --- Telegram ------------------------------------------------------------------------------
@@ -277,7 +330,7 @@ def handle_update(tg, update: dict) -> None:
     state = dict.fromkeys(FIELDS)
     if not parse_wifi(text):
         state["kind"] = "t"  # only Wi-Fi-looking text needs the extra question
-    question, markup = next_step(state)
+    question, markup = next_step(state, text)
     tg.call(
         "sendMessage",
         chat_id=chat_id,
@@ -294,7 +347,11 @@ def handle_callback(tg, cq: dict) -> None:
     text = (source.get("text") or "").strip()
     state = decode(cq.get("data") or "")
 
-    if not chat_id or not text or state is None or (state["kind"] == "w" and not parse_wifi(text)):
+    if (
+        not chat_id or not text or state is None
+        or (state["kind"] == "w" and not parse_wifi(text))
+        or (state["bg"] and state["fmt"] != "jpg")  # only JPG has a background
+    ):
         tg.call("answerCallbackQuery", callback_query_id=cq["id"], text=NO_TEXT, show_alert=True)
         return
 
@@ -307,7 +364,7 @@ def handle_callback(tg, cq: dict) -> None:
             **({"reply_markup": markup} if markup else {}),
         )
 
-    step = next_step(state)
+    step = next_step(state, text)
     if step:
         tg.call("answerCallbackQuery", callback_query_id=cq["id"])
         edit(*step)
@@ -324,13 +381,13 @@ def handle_callback(tg, cq: dict) -> None:
     if build_qr(data).version >= DENSE_VERSION:
         notes.append("Текст длинный, код получился плотным: с экрана его прочитают не все камеры. Лучше распечатать покрупнее")
     caption += "".join(f"\n\n⚠️ {n}" for n in notes if n)
-    image = make_qr(data, fmt, state["fg"], state["bg"], state["dots"], state["corners"] or "sq")
+    image = make_qr(data, fmt, state["fg"], state["bg"], state["dots"])
     tg.call(
         "sendDocument",
         chat_id=chat_id,
         caption=caption,
         reply_parameters={"message_id": source["message_id"]},
-        files={"document": (f"qr.{fmt}", image, f"image/{'png' if fmt == 'png' else 'jpeg'}")},
+        files={"document": (f"qr.{fmt}", image, FORMATS[fmt])},
     )
 
 
