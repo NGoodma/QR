@@ -118,8 +118,8 @@ def test_steps_in_order_with_back_buttons():
     edit = run(tap(q({**s, "fmt": "png", "dots": "ci"}))).calls[-1]
     assert edit["text"] == "Выберите цвет"
     rows = buttons(edit["reply_markup"])
-    assert rows[0] == ["⚫ Чёрный", "⚪ Белый"] and rows[-1] == ["← Назад"]
-    assert sum(len(r) for r in rows[:-1]) == len(bot.COLORS)
+    assert rows[0] == ["⚫ Чёрный", "⚪ Белый"] and rows[-2:] == [["🎨 Свой цвет (HEX)"], ["← Назад"]]
+    assert sum(len(r) for r in rows[:-2]) == len(bot.COLORS)
     assert edit["reply_markup"]["inline_keyboard"][-1][0]["callback_data"] == q({**s, "fmt": "png"})
 
 
@@ -136,7 +136,7 @@ def test_png_and_svg_are_sent_right_after_color(fmt, mime, dots):
     doc = tg.calls[-1]
     name, data, sent_mime = doc["files"]["document"]
     assert (name, sent_mime) == (f"qr.{fmt}", mime)
-    assert doc["reply_parameters"] == {"message_id": 10}
+    assert doc["reply_parameters"]["message_id"] == 10
     style = bot.DOTS[dots][1]
     assert tg.calls[1]["text"] == f"Готово: {fmt.upper()}, {style}, красный"
     if fmt == "png":
@@ -153,7 +153,8 @@ def test_jpg_asks_for_background_without_the_same_color():
     rows = buttons(edit["reply_markup"])
     assert rows[0] == ["⚪ Белый"]
     assert "⚫ Чёрный" not in sum(rows, [])
-    data = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"][:-1] for b in row]
+    assert rows[-2:] == [["🎨 Свой цвет (HEX)"], ["← Назад"]]
+    data = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"][:-2] for b in row]
     assert all(d.startswith("q:t:jpg:sq:black:") for d in data)
 
 
@@ -177,11 +178,123 @@ def test_wifi_code_and_caption():
     "q:t:png:sq:red:white",   # PNG has no background
     "q:t:gif:::", "q:t:jpg:star::", "q:x::::", "q:t:jpg:sq:pink:",
     "q:t:jpg", "zzz", "q:t:jpg:sq:black:white:rd",  # the version with corners
+    "q:t:jpg:sq:000000:black",                     # custom code color equal to the background
+    "q:t:png:sq:ff88:", "x:t:jpg:sq:black:white",  # bad hex; HEX asked when nothing is left to choose
     "f:jpg", "c:png:red", "b:black:white",           # the first version
 ])
 def test_bad_callbacks_send_nothing(data):
     tg = run(tap(data))
     assert "sendDocument" not in tg.methods() and "editMessageText" not in tg.methods()
+
+
+# --- custom HEX colors ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value, color", [
+    ("#FF8800", "ff8800"), ("ff8800", "ff8800"), (" #f80 ", "ff8800"), ("#ff880", None), ("оранжевый", None), ("#gg0000", None),
+])
+def test_parse_hex(value, color):
+    assert bot.parse_hex(value) == color
+
+
+def reply_to(prompt_call, text, message_id=20):
+    """The user's reply to the bot's HEX prompt, as Telegram delivers it (the prompt comes back as reply_to_message)."""
+    prompt = {k: prompt_call[k] for k in ("text", "entities")}
+    return {"message": {
+        "message_id": message_id, "chat": {"id": 5, "type": "private"}, "text": text,
+        "reply_to_message": {"message_id": 12, "from": {"is_bot": True}, **prompt},
+    }}
+
+
+def ask_hex(state, source=URL):
+    """Press "🎨 Свой цвет (HEX)"; returns the prompt the bot sends."""
+    tg = run(tap(bot.encode({f: state.get(f) for f in bot.FIELDS}, "x"), source))
+    assert tg.methods() == ["answerCallbackQuery", "sendMessage"]
+    return tg.calls[-1]
+
+
+def test_hex_prompt_uses_force_reply_and_carries_the_state():
+    p = ask_hex({"kind": "t", "fmt": "png", "dots": "ci"})
+    assert p["reply_markup"] == {"force_reply": True, "input_field_placeholder": "#ff8800"}
+    assert p["text"].startswith("🎨 Пришли HEX-код цвета кода") and p["text"].endswith(URL)
+    assert bot.read_prompt({"text": p["text"], "entities": p["entities"]}) == (
+        {"kind": "t", "fmt": "png", "dots": "ci", "fg": None, "bg": None}, URL, 11, 10)
+
+
+def test_hex_reply_for_png_sends_the_code_right_away():
+    p = ask_hex({"kind": "t", "fmt": "png", "dots": "sq"})
+    tg = run(reply_to(p, "#FF8800"))
+    assert tg.methods() == ["deleteMessage", "editMessageText", "sendDocument"]
+    assert tg.calls[0]["message_id"] == 12  # the prompt is removed
+    assert tg.calls[1] == {"method": "editMessageText", "files": None, "chat_id": 5, "message_id": 11,
+                           "text": "Готово: PNG, квадратные точки, #ff8800"}
+    doc = tg.calls[-1]
+    assert doc["reply_parameters"]["message_id"] == 10
+    img = Image.open(io.BytesIO(doc["files"]["document"][1])).convert("RGBA")
+    colors = {px[:3] for px in img.get_flattened_data() if px[3] == 255}
+    assert (255, 136, 0) in colors
+
+
+def test_hex_for_jpg_code_then_background():
+    s = {"kind": "t", "fmt": "jpg", "dots": "rd"}
+    tg = run(reply_to(ask_hex(s), "#123456"))
+    edit = tg.calls[-1]
+    assert edit["method"] == "editMessageText" and edit["message_id"] == 11 and edit["text"] == "Выберите цвет фона"
+    rows = buttons(edit["reply_markup"])
+    assert rows[0] == ["⚫ Чёрный", "⚪ Белый"]  # a custom code color hides no palette color
+    assert edit["reply_markup"]["inline_keyboard"][0][1]["callback_data"] == "q:t:jpg:rd:123456:white"
+    # and a custom background too
+    p = ask_hex({**s, "fg": "123456"})
+    assert "цвета фона" in p["text"]
+    tg = run(reply_to(p, "fafafa"))
+    assert tg.methods()[-1] == "sendDocument"
+    assert tg.calls[-2]["text"] == "Готово: JPG, скруглённые точки, #123456 на фоне #fafafa"
+    img = Image.open(io.BytesIO(tg.calls[-1]["files"]["document"][1]))
+    assert all(abs(a - b) < 6 for a, b in zip(img.getpixel((2, 2)), (250, 250, 250)))
+
+
+def test_custom_colors_work_through_buttons_too():
+    tg = run(tap({"kind": "t", "fmt": "jpg", "dots": "sq", "fg": "123456", "bg": "white"}))
+    assert tg.methods()[-1] == "sendDocument"
+    assert tg.calls[1]["text"] == "Готово: JPG, квадратные точки, #123456 на белом фоне"
+
+
+def test_bad_hex_reply_asks_again():
+    p = ask_hex({"kind": "t", "fmt": "png", "dots": "sq"})
+    tg = run(reply_to(p, "оранжевенький"))
+    [again] = tg.calls
+    assert again["method"] == "sendMessage" and again["text"].startswith(bot.HEX_HINT)
+    assert again["reply_markup"]["force_reply"]
+    assert bot.read_prompt(again)[0] == bot.read_prompt(p)[0]  # same state, the user can just try again
+
+
+def test_same_background_as_code_is_refused():
+    p = ask_hex({"kind": "t", "fmt": "jpg", "dots": "sq", "fg": "black"})
+    tg = run(reply_to(p, "#000"))
+    assert tg.methods() == ["sendMessage"] and "тот же цвет" in tg.calls[0]["text"]
+
+
+def test_hex_prompt_keeps_wifi_and_unicode_text_exact():
+    text = "Кафе 🌼 Ромашка\nпароль123"
+    p = ask_hex({"kind": "w", "fmt": "svg", "dots": "sq"}, source=text)
+    assert bot.read_prompt(p)[1] == text
+    tg = run(reply_to(p, "#204080"))
+    assert tg.calls[-1]["caption"] == "Вот QR-код для подключения к сети «Кафе 🌼 Ромашка»"
+
+
+def test_hex_without_the_prompt_gets_a_hint():
+    assert run(link_message("#ff8800")).calls[0]["text"] == bot.HEX_WITHOUT_PROMPT
+    # a reply to some other bot message is just a new text
+    other = link_message("#ff8800")
+    other["message"]["reply_to_message"] = {"message_id": 3, "text": "Выберите цвет"}
+    assert run(other).calls[0]["text"] == bot.HEX_WITHOUT_PROMPT
+
+
+def test_hex_prompt_fits_telegram_limits():
+    text = "я" * 1150  # about the longest text a QR code takes
+    assert bot.fits(text)
+    p = ask_hex({"kind": "t", "fmt": "jpg", "dots": "ci", "fg": "ffffff"}, source=text)
+    assert bot._utf16(p["text"]) <= 4096
 
 
 def test_lost_text_shows_alert():

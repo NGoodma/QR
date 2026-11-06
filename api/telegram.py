@@ -5,6 +5,10 @@ Flow: send a link or any text -> (two lines that look like a Wi-Fi name and pass
 background color -> the QR code arrives as a file. PNG and SVG have a transparent background.
 Every step after the first has a "Back" button.
 
+Custom colors: "🎨 Свой цвет (HEX)" sends a prompt with ForceReply, so the user's next message is
+a reply to it. The prompt carries everything needed: the choices so far in a link's #fragment and
+the user's text in a quote. A reply to it with "#ff8800" continues the flow.
+
 No storage: the bot's menu message is a reply to the user's text, so every button press
 finds the text in callback_query.message.reply_to_message. The choices so far travel in
 callback_data as "q:<kind>:<fmt>:<dots>:<fg>:<bg>", empty fields not chosen yet.
@@ -16,8 +20,9 @@ import io
 import json
 import logging
 import os
+import re
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import qrcode
 import requests
@@ -42,6 +47,28 @@ COLORS = [
     ("brown", "Коричневый", "#6d4c41", "🟤", "коричневом"),
 ]
 COLOR = {c[0]: c for c in COLORS}
+HEX = re.compile(r"[0-9a-f]{6}")  # a custom color in callback_data: 6 hex digits, no "#"
+
+
+def parse_hex(value: str) -> str | None:
+    """'#FF8800', 'ff8800', '#f80' -> 'ff8800'; None if it is not a color."""
+    v = value.strip().lower().removeprefix("#")
+    if re.fullmatch(r"[0-9a-f]{3}", v):
+        v = "".join(ch * 2 for ch in v)
+    return v if HEX.fullmatch(v) else None
+
+
+def hex_of(color: str) -> str:
+    return COLOR[color][2] if color in COLOR else f"#{color}"
+
+
+def color_name(color: str) -> str:
+    return COLOR[color][1].lower() if color in COLOR else f"#{color}"
+
+
+def on_background(color: str) -> str:
+    return f"на {COLOR[color][4]} фоне" if color in COLOR else f"на фоне #{color}"
+
 
 # Dot styles: (button, summary, drawer for data dots, drawer for the three corner squares).
 # Round dots keep rounded corner squares: corner squares made of dots fail on some scanners.
@@ -130,7 +157,7 @@ def make_qr(data: str, fmt: str, fg: str, bg: str | None = None, dots: str = "sq
     """PNG and SVG: transparent background. JPG: background `bg`."""
     qr = build_qr(data)
     if fmt == "svg":
-        return make_svg(qr, COLOR[fg][2], dots)
+        return make_svg(qr, hex_of(fg), dots)
     _, _, drawer, eye = DOTS[dots]
     # Draw black on white, then use it as a mask to paint the colors (also gives a clean transparent PNG).
     mask = ImageOps.invert(
@@ -139,10 +166,10 @@ def make_qr(data: str, fmt: str, fg: str, bg: str | None = None, dots: str = "sq
     size = mask.size
     buf = io.BytesIO()
     if fmt == "png":
-        img = Image.composite(Image.new("RGBA", size, COLOR[fg][2]), Image.new("RGBA", size, (0, 0, 0, 0)), mask)
+        img = Image.composite(Image.new("RGBA", size, hex_of(fg)), Image.new("RGBA", size, (0, 0, 0, 0)), mask)
         img.save(buf, format="PNG")
     else:
-        img = Image.composite(Image.new("RGB", size, COLOR[fg][2]), Image.new("RGB", size, COLOR[bg][2]), mask)
+        img = Image.composite(Image.new("RGB", size, hex_of(fg)), Image.new("RGB", size, hex_of(bg)), mask)
         img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
 
@@ -207,12 +234,12 @@ MIN_GRAY_DIFF = 80  # below this some pairs fail to scan (measured on every pair
 
 def readability_note(fg: str, bg: str | None) -> str | None:
     """Warn about combinations scanners struggle with."""
-    lf = _luminance(COLOR[fg][2])
+    lf = _luminance(hex_of(fg))
     if bg is None:  # PNG or SVG, transparent background
         return "Светлый код на прозрачном фоне виден только на тёмном фоне" if lf > 0.5 else None
-    if lf > _luminance(COLOR[bg][2]):
+    if lf > _luminance(hex_of(bg)):
         return "Светлый код на тёмном фоне читают не все сканеры. Надёжнее тёмный код на светлом фоне"
-    if _gray(COLOR[bg][2]) - _gray(COLOR[fg][2]) < MIN_GRAY_DIFF:
+    if _gray(hex_of(bg)) - _gray(hex_of(fg)) < MIN_GRAY_DIFF:
         return "Цвета плохо различаются: код может не считаться"
     return None
 
@@ -222,22 +249,24 @@ def readability_note(fg: str, bg: str | None) -> str | None:
 FIELDS = ("kind", "fmt", "dots", "fg", "bg")
 
 
-def encode(state: dict) -> str:
-    return "q:" + ":".join(state.get(f) or "" for f in FIELDS)
+def encode(state: dict, prefix: str = "q") -> str:
+    """prefix "q": a choice; "x": ask for a custom HEX color for the next color step."""
+    return f"{prefix}:" + ":".join(state.get(f) or "" for f in FIELDS)
 
 
-def decode(data: str) -> dict | None:
+def decode(data: str, prefix: str = "q") -> dict | None:
     """Parse callback_data; None if it is malformed or holds values we don't know."""
     parts = data.split(":")
-    if len(parts) != len(FIELDS) + 1 or parts[0] != "q":
+    if len(parts) != len(FIELDS) + 1 or parts[0] != prefix:
         return None
     s = {f: v or None for f, v in zip(FIELDS, parts[1:])}
     allowed = {
         "kind": {"t", "w"}, "fmt": set(FORMATS), "dots": set(DOTS), "fg": set(COLOR), "bg": set(COLOR),
     }
-    if any(v is not None and v not in allowed[f] for f, v in s.items()):
+    is_color = lambda f, v: f in ("fg", "bg") and HEX.fullmatch(v)  # noqa: E731
+    if any(v is not None and v not in allowed[f] and not is_color(f, v) for f, v in s.items()):
         return None
-    if s["fg"] and s["fg"] == s["bg"]:
+    if s["fg"] and s["bg"] and hex_of(s["fg"]) == hex_of(s["bg"]):
         return None
     return s
 
@@ -260,6 +289,10 @@ def _back(state: dict, text: str) -> list[list]:
     return [[{"text": "← Назад", "callback_data": encode({**state, chosen[-1]: None})}]]
 
 
+def _hex_button(state: dict) -> list[dict]:
+    return [{"text": "🎨 Свой цвет (HEX)", "callback_data": encode(state, "x")}]
+
+
 def next_step(state: dict, text: str) -> tuple[str, dict] | None:
     """The next question and its keyboard, or None when everything is chosen."""
     if not state["kind"]:
@@ -276,11 +309,12 @@ def next_step(state: dict, text: str) -> tuple[str, dict] | None:
         question, rows = "Выберите стиль точек", [_buttons(state, "dots", [(k, v[0]) for k, v in DOTS.items()])]
     elif not state["fg"]:
         b = _buttons(state, "fg", [(cid, f"{e} {name}") for cid, name, _, e, _ in COLORS])
-        question, rows = "Выберите цвет", _rows(b, 2)
+        question, rows = "Выберите цвет", _rows(b, 2) + [_hex_button(state)]
     elif state["fmt"] == "jpg" and not state["bg"]:
-        colors = [(cid, f"{e} {name}") for cid, name, _, e, _ in COLORS if cid != state["fg"]]
-        first = 2 if state["fg"] not in ("black", "white") else 1  # black and white on the first row
-        question, rows = "Выберите цвет фона", _rows(_buttons(state, "bg", colors), first)
+        fg = hex_of(state["fg"])
+        colors = [(cid, f"{e} {name}") for cid, name, hx, e, _ in COLORS if hx != fg]
+        first = 1 if fg in (COLOR["black"][2], COLOR["white"][2]) else 2  # black and white on the first row
+        question, rows = "Выберите цвет фона", _rows(_buttons(state, "bg", colors), first) + [_hex_button(state)]
     else:
         return None
     return question, {"inline_keyboard": rows + _back(state, text)}
@@ -288,7 +322,7 @@ def next_step(state: dict, text: str) -> tuple[str, dict] | None:
 
 def summary(state: dict) -> str:
     fmt, fg, bg = state["fmt"], state["fg"], state["bg"]
-    return ", ".join([fmt.upper(), DOTS[state["dots"]][1], COLOR[fg][1].lower() + (f" на {COLOR[bg][4]} фоне" if bg else "")])
+    return ", ".join([fmt.upper(), DOTS[state["dots"]][1], color_name(fg) + (f" {on_background(bg)}" if bg else "")])
 
 
 # --- Telegram ------------------------------------------------------------------------------
@@ -310,6 +344,57 @@ class Telegram:
         return body["result"]
 
 
+# --- custom HEX colors: a prompt that carries the state -------------------------------------
+
+PICKER = "https://htmlcolorcodes.com/color-picker/"  # the "pick a color" link; our state rides in its #fragment
+HEX_HINT = "Не понял цвет. Пришли HEX-код вида #ff8800"
+HEX_WITHOUT_PROMPT = "Похоже на цвет. Чтобы задать свой цвет, нажми «🎨 Свой цвет (HEX)» под вопросом про цвет"
+
+
+def _utf16(s: str) -> int:
+    """Telegram counts entity offsets in UTF-16 code units."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def hex_prompt(state: dict, text: str, menu_id: int, source_id: int, error: str | None = None) -> dict:
+    """sendMessage params for "send me a HEX": ForceReply, the state in a link, the text in a quote."""
+    which = "фона" if state["fg"] else "кода"
+    head = (f"{error}\n\n" if error else "") + f"🎨 Пришли HEX-код цвета {which}, например #ff8800. "
+    link = "Подобрать цвет"
+    body = "\n\nQR-код для:\n"
+    full = head + link + body + text
+    url = f"{PICKER}#qr={quote(encode(state, 'x'))}/{menu_id}/{source_id}"
+    return {
+        "text": full,
+        "entities": [
+            {"type": "text_link", "offset": _utf16(head), "length": _utf16(link), "url": url},
+            {"type": "expandable_blockquote", "offset": _utf16(head + link + body), "length": _utf16(text)},
+        ],
+        "link_preview_options": {"is_disabled": True},
+        "reply_markup": {"force_reply": True, "input_field_placeholder": "#ff8800"},
+    }
+
+
+def read_prompt(msg: dict) -> tuple[dict, str, int, int] | None:
+    """(state, text, menu_id, source_id) from our HEX prompt, or None if it is not one."""
+    text16 = (msg.get("text") or "").encode("utf-16-le")
+    piece = lambda e: text16[e["offset"] * 2 : (e["offset"] + e["length"]) * 2].decode("utf-16-le")  # noqa: E731
+    url = quoted = None
+    for e in msg.get("entities") or []:
+        if e.get("type") == "text_link" and e.get("url", "").startswith(PICKER + "#qr="):
+            url = e["url"]
+        elif e.get("type") in ("blockquote", "expandable_blockquote"):
+            quoted = piece(e)
+    if not url or not quoted:
+        return None
+    try:
+        data, menu_id, source_id = url.split("#qr=", 1)[1].rsplit("/", 2)
+        state = decode(unquote(data), "x")
+        return (state, quoted, int(menu_id), int(source_id)) if state else None
+    except ValueError:
+        return None
+
+
 # --- bot logic -----------------------------------------------------------------------------
 
 
@@ -321,8 +406,14 @@ def handle_update(tg, update: dict) -> None:
     if not text or msg.get("chat", {}).get("type") != "private":
         return
     chat_id = msg["chat"]["id"]
+    prompt = read_prompt(msg.get("reply_to_message") or {})
+    if prompt:
+        return handle_hex(tg, chat_id, msg, prompt)
     if text.startswith(("/start", "/help")):
         tg.call("sendMessage", chat_id=chat_id, text=START_TEXT)
+        return
+    if text.startswith("#") and parse_hex(text):
+        tg.call("sendMessage", chat_id=chat_id, text=HEX_WITHOUT_PROMPT)
         return
     if not fits(text):
         tg.call("sendMessage", chat_id=chat_id, text=TOO_LONG)
@@ -340,39 +431,32 @@ def handle_update(tg, update: dict) -> None:
     )
 
 
-def handle_callback(tg, cq: dict) -> None:
-    menu = cq.get("message") or {}
-    chat_id = menu.get("chat", {}).get("id")
-    source = menu.get("reply_to_message") or {}
-    text = (source.get("text") or "").strip()
-    state = decode(cq.get("data") or "")
+def _valid(state: dict | None, text: str) -> bool:
+    return bool(
+        text and state is not None
+        and not (state["kind"] == "w" and not parse_wifi(text))
+        and not (state["bg"] and state["fmt"] != "jpg")  # only JPG has a background
+    )
 
-    if (
-        not chat_id or not text or state is None
-        or (state["kind"] == "w" and not parse_wifi(text))
-        or (state["bg"] and state["fmt"] != "jpg")  # only JPG has a background
-    ):
-        tg.call("answerCallbackQuery", callback_query_id=cq["id"], text=NO_TEXT, show_alert=True)
-        return
 
-    def edit(message, markup=None):
-        tg.call(
-            "editMessageText",
-            chat_id=chat_id,
-            message_id=menu["message_id"],
-            text=message,
-            **({"reply_markup": markup} if markup else {}),
-        )
+def _edit(tg, chat_id, message_id, text, markup=None):
+    tg.call(
+        "editMessageText",
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        **({"reply_markup": markup} if markup else {}),
+    )
 
+
+def advance(tg, chat_id: int, menu_id: int, source_id: int, state: dict, text: str) -> None:
+    """Show the next question in the menu, or draw and send the QR code if everything is chosen."""
     step = next_step(state, text)
     if step:
-        tg.call("answerCallbackQuery", callback_query_id=cq["id"])
-        edit(*step)
+        _edit(tg, chat_id, menu_id, *step)
         return
-
+    _edit(tg, chat_id, menu_id, f"Готово: {summary(state)}")
     data = payload(text, state["kind"])
-    tg.call("answerCallbackQuery", callback_query_id=cq["id"], text="Рисую QR-код…")
-    edit(f"Готово: {summary(state)}")
     fmt = state["fmt"]
     caption = (
         f"Вот QR-код для подключения к сети «{parse_wifi(text)[0]}»" if state["kind"] == "w" else "Вот твой QR-код"
@@ -386,9 +470,48 @@ def handle_callback(tg, cq: dict) -> None:
         "sendDocument",
         chat_id=chat_id,
         caption=caption,
-        reply_parameters={"message_id": source["message_id"]},
+        reply_parameters={"message_id": source_id, "allow_sending_without_reply": True},
         files={"document": (f"qr.{fmt}", image, FORMATS[fmt])},
     )
+
+
+def handle_callback(tg, cq: dict) -> None:
+    menu = cq.get("message") or {}
+    chat_id = menu.get("chat", {}).get("id")
+    source = menu.get("reply_to_message") or {}
+    text = (source.get("text") or "").strip()
+    data = cq.get("data") or ""
+    ask_hex = data.startswith("x:")
+    state = decode(data, "x" if ask_hex else "q")
+
+    if not chat_id or not _valid(state, text) or (ask_hex and state["bg"]):
+        tg.call("answerCallbackQuery", callback_query_id=cq["id"], text=NO_TEXT, show_alert=True)
+        return
+
+    if ask_hex:
+        tg.call("answerCallbackQuery", callback_query_id=cq["id"])
+        tg.call("sendMessage", chat_id=chat_id, **hex_prompt(state, text, menu["message_id"], source["message_id"]))
+        return
+    final = next_step(state, text) is None
+    tg.call("answerCallbackQuery", callback_query_id=cq["id"], **({"text": "Рисую QR-код…"} if final else {}))
+    advance(tg, chat_id, menu["message_id"], source["message_id"], state, text)
+
+
+def handle_hex(tg, chat_id: int, msg: dict, prompt: tuple) -> None:
+    """A reply to our HEX prompt: take the color and carry on where the menu was."""
+    state, text, menu_id, source_id = prompt
+    color = parse_hex(msg.get("text") or "")
+    field = "bg" if state["fg"] else "fg"
+    new = {**state, field: color}
+    if not color or not _valid(state, text) or (field == "bg" and hex_of(color) == hex_of(state["fg"])):
+        error = "Это тот же цвет, что и у кода. Пришли другой" if color else HEX_HINT
+        tg.call("sendMessage", chat_id=chat_id, **hex_prompt(state, text, menu_id, source_id, error))
+        return
+    try:  # the prompt has done its job
+        tg.call("deleteMessage", chat_id=chat_id, message_id=msg["reply_to_message"]["message_id"])
+    except RuntimeError:
+        pass
+    advance(tg, chat_id, menu_id, source_id, new, text)
 
 
 # --- Vercel entry --------------------------------------------------------------------------
